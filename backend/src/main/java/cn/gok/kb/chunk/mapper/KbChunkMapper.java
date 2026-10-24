@@ -36,11 +36,28 @@ public interface KbChunkMapper extends BaseMapper<KbChunk> {
      */
     @Insert("""
             <script>
-            INSERT INTO kb_chunk (doc_id, page_no, seq_no, content, char_count) VALUES
+            INSERT INTO kb_chunk (doc_id, page_no, seq_no, content, char_count, embedding, embed_model) VALUES
             <foreach collection="list" item="it" separator=",">
-                (#{it.docId}, #{it.pageNo}, #{it.seqNo}, #{it.content}, #{it.charCount})
+                (#{it.docId}, #{it.pageNo}, #{it.seqNo}, #{it.content}, #{it.charCount},
+                 #{it.embedding,jdbcType=LONGVARCHAR}, #{it.embedModel,jdbcType=VARCHAR})
             </foreach>
             </script>
             """)
     int batchInsert(@Param("list") List<KbChunk> list);
+
+    /**
+     * 只查向量检索需要的最小字段：切片 id + 向量。
+     * 正文和文件名已经在 BM25 索引里了，向量索引按 chunkId 就能对上，不必重复加载。
+     */
+    @Select("""
+            SELECT c.id        AS chunk_id,
+                   c.embedding AS embedding
+            FROM kb_chunk c
+            WHERE c.embedding IS NOT NULL
+            """)
+    List<Map<String, Object>> selectEmbeddings();
+
+    /** 统计有多少切片还没有向量，用于启动时判断要不要提示用户重算 */
+    @Select("SELECT COUNT(*) FROM kb_chunk WHERE embedding IS NULL")
+    long countMissingEmbedding();
 }

@@ -14,6 +14,10 @@ spring:
     multipart:
       max-file-size: 30MB
       max-request-size: 30MB
+  # SSE 长连接：Spring MVC 默认 30 秒就掐断，必须显式放宽
+  mvc:
+    async:
+      request-timeout: 180000
   # 走 OpenAI 兼容协议，base-url 换成 DeepSeek / 通义 / 本地 Ollama 都能直接用
   ai:
     openai:
@@ -23,6 +27,14 @@ spring:
         options:
           model: ${OPENAI_MODEL:gpt-4o-mini}
           temperature: 0.2
+      # 向量检索用。换成任何提供 /v1/embeddings 的服务都能跑：
+      #   阿里百炼  text-embedding-v3      base-url https://dashscope.aliyuncs.com/compatible-mode
+      #   硅基流动  BAAI/bge-m3            base-url https://api.siliconflow.cn
+      #   智谱      embedding-3            base-url https://open.bigmodel.cn/api/paas/v4
+      #   本地      nomic-embed-text       base-url http://localhost:11434/v1  （Ollama）
+      embedding:
+        options:
+          model: ${OPENAI_EMBEDDING_MODEL:text-embedding-3-small}
 
 mybatis-plus:
   configuration:
@@ -39,11 +51,25 @@ kb:
     top-k: 5
     # 归一化后的相关度下限，命中低于该值视为「查不到」，避免硬凑答案
     min-score: 0.15
+    # 混合检索时两路各自多召回几倍，再交给 RRF 融合
+    recall-factor: 4
+    # 向量余弦下限：bge 系列中文模型 0.5 以上算强相关，0.35 是弱相关
+    vector-min-similarity: 0.35
+    # RRF 平滑常数，业界通用 60
+    rrf-k: 60
+    # 两路权重。发现向量把无关切片顶到第一时，把 vector-weight 调低（0.3 左右）
+    bm25-weight: 1.0
+    vector-weight: 1.0
   upload-dir: ./data/uploads
   ai:
     # 没有 API Key 时保持 false：检索功能照常可用，只是不生成答案
     enabled: ${KB_AI_ENABLED:false}
     max-context-chunks: 5
+    # 向量检索开关。开之前必须先配好 embedding 模型，否则启动日志会告警并自动退回纯 BM25
+    embedding-enabled: ${KB_EMBEDDING_ENABLED:false}
+    embedding-batch-size: 16
+    # 单会话保留的消息条数（user + assistant 合计），多了会挤占上下文
+    memory-max-messages: 10
 
 logging:
   level:

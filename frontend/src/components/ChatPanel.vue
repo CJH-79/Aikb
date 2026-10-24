@@ -20,17 +20,23 @@
         <div class="bubble-wrap">
           <div class="bubble">
             <div v-if="m.mode === 'retrieval'" class="mode-tip retrieval">
-              {{ m.tip }}
+              {{ m.tip || '纯检索模式：以下是资料原文摘录' }}
             </div>
             <div v-else-if="m.mode === 'empty'" class="mode-tip empty">
-              {{ m.tip }}
+              {{ m.tip || '没有检索到相关内容' }}
             </div>
             <div class="answer" v-html="render(m.text)"></div>
+            <span v-if="m.streaming" class="caret"></span>
           </div>
 
-          <div v-if="m.mode && m.mode !== 'empty'" class="meta-row">
+          <div v-if="m.mode && m.mode !== 'empty' && !m.streaming" class="meta-row">
             <span class="mode">{{ modeLabel(m.mode) }}</span>
+            <span v-if="recallLabel(m.citations)" class="recall">{{ recallLabel(m.citations) }}</span>
             <span>耗时 {{ m.elapsedMs }} ms</span>
+          </div>
+
+          <div v-if="m.query && m.query !== m.ask" class="rewrite-hint">
+            追问改写后的检索词：{{ m.query }}
           </div>
 
           <div v-if="m.citations && m.citations.length" class="citations">
@@ -44,6 +50,9 @@
                   <span class="no">[{{ c.no }}]</span>
                   <span class="file" :title="c.fileName">{{ c.fileName }}</span>
                   <span class="page">第 {{ c.pageNo }} 页</span>
+                  <span v-if="c.recall" :class="['src', c.recall.replace('+', '-')]">
+                    {{ sourceLabel(c.recall) }}
+                  </span>
                   <span class="score">相关度 {{ Number(c.score).toFixed(2) }}</span>
                 </div>
                 <div class="cite-body">{{ c.snippet }}</div>
@@ -52,11 +61,12 @@
           </div>
         </div>
       </div>
+    </div>
 
-      <div v-if="loading" class="msg assistant">
-        <div class="avatar">AI</div>
-        <div class="bubble thinking">正在检索资料并生成答案…</div>
-      </div>
+    <div v-if="conversationId" class="session-bar">
+      <span class="cid" :title="conversationId">会话 {{ conversationId }}</span>
+      <span class="turn">已进行 {{ turns }} 轮（追问会带上文）</span>
+      <button class="new-session" @click="newSession">新开会话</button>
     </div>
 
     <div class="composer">
@@ -76,7 +86,7 @@
 
 <script setup>
 import { computed, nextTick, reactive, ref } from 'vue'
-import { ask } from '../api'
+import { resetConversation, streamChat } from '../api'
 
 defineProps({
   ready: { type: Boolean, default: false }
@@ -94,12 +104,34 @@ const loading = ref(false)
 const expanded = reactive({})
 const scrollRef = ref(null)
 
+/** 服务端下发的会话 id。首轮由后端生成，之后每轮带上它，多轮记忆才连得上 */
+const conversationId = ref('')
+
 const canSend = computed(() => draft.value.trim().length > 0 && !loading.value)
+const turns = computed(() => messages.value.filter((m) => m.role === 'user').length)
 
 const modeLabel = (mode) => {
   if (mode === 'llm') return '模型生成'
   if (mode === 'retrieval') return '纯检索'
+  if (mode === 'error') return '出错'
   return '无结果'
+}
+
+const sourceLabel = (recall) => {
+  if (recall === 'bm25') return 'BM25'
+  if (recall === 'vector') return '向量'
+  if (recall === 'bm25+vector') return '双路'
+  return recall
+}
+
+/** 整轮答案用的是哪几路召回，给个整体标识 */
+const recallLabel = (citations) => {
+  if (!citations || citations.length === 0) return ''
+  const anyVector = citations.some((c) => (c.recall || '').includes('vector'))
+  const anyBm25 = citations.some((c) => (c.recall || '').includes('bm25'))
+  if (anyVector && anyBm25) return 'BM25 + 向量混合召回'
+  if (anyVector) return '向量召回'
+  return 'BM25 召回'
 }
 
 // 只处理 **加粗** 和换行，避免引入 markdown 解析库后还要防 XSS
@@ -123,6 +155,17 @@ const toggle = (i) => {
   expanded[i] = !expanded[i]
 }
 
+const newSession = async () => {
+  const cid = conversationId.value
+  conversationId.value = ''
+  messages.value = []
+  Object.keys(expanded).forEach((k) => delete expanded[k])
+  if (cid) {
+    // 清不掉也不影响：服务端还有窗口上限兜底
+    resetConversation(cid).catch(() => {})
+  }
+}
+
 const send = async () => {
   const question = draft.value.trim()
   if (!question || loading.value) return
@@ -132,24 +175,49 @@ const send = async () => {
   loading.value = true
   await scrollToBottom()
 
+  // 先放一个空的助手消息占位，流式内容直接往里追加
+  const msg = reactive({
+    role: 'assistant',
+    text: '',
+    ask: question,
+    query: '',
+    mode: '',
+    citations: [],
+    elapsedMs: 0,
+    tip: '',
+    streaming: true
+  })
+  messages.value.push(msg)
+  await scrollToBottom()
+
   try {
-    const res = await ask(question)
-    messages.value.push({
-      role: 'assistant',
-      text: res.answer,
-      mode: res.mode,
-      citations: res.citations || [],
-      elapsedMs: res.elapsedMs,
-      tip: res.tip
-    })
+    await streamChat(
+        { question, conversationId: conversationId.value || undefined },
+        {
+          meta: (p) => {
+            if (p.conversationId) conversationId.value = p.conversationId
+            msg.mode = p.mode || ''
+            msg.citations = p.citations || []
+            msg.query = p.query || ''
+            if (p.tip) msg.tip = p.tip
+            scrollToBottom()
+          },
+          delta: (p) => {
+            msg.text += p.t || ''
+            scrollToBottom()
+          },
+          done: (p) => {
+            if (p.mode) msg.mode = p.mode
+            msg.elapsedMs = p.elapsedMs || 0
+            if (p.tip) msg.tip = p.tip
+          }
+        }
+    )
   } catch (e) {
-    messages.value.push({
-      role: 'assistant',
-      text: '请求失败，请检查后端服务是否正常。',
-      mode: 'empty',
-      citations: []
-    })
+    msg.text = msg.text || '请求失败：' + (e.message || '请检查后端服务是否正常')
+    msg.mode = 'empty'
   } finally {
+    msg.streaming = false
     loading.value = false
     await scrollToBottom()
   }
@@ -286,8 +354,20 @@ const send = async () => {
   border-top-left-radius: 3px;
 }
 
-.bubble.thinking {
-  color: #9aa1b1;
+.caret {
+  display: inline-block;
+  width: 2px;
+  height: 13px;
+  margin-left: 2px;
+  vertical-align: -2px;
+  background: #4f7cf7;
+  animation: blink 1s steps(2, start) infinite;
+}
+
+@keyframes blink {
+  to {
+    visibility: hidden;
+  }
 }
 
 .mode-tip {
@@ -314,10 +394,25 @@ const send = async () => {
   margin-top: 6px;
   font-size: 11px;
   color: #a8aebc;
+  align-items: center;
 }
 
 .mode {
   color: #4f7cf7;
+}
+
+.recall {
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: #eef2ff;
+  color: #4f7cf7;
+}
+
+.rewrite-hint {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #b0b6c4;
+  word-break: break-all;
 }
 
 .citations {
@@ -369,11 +464,29 @@ const send = async () => {
 }
 
 .cite-head .file {
-  max-width: 200px;
+  max-width: 180px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: #2b3550;
+}
+
+.cite-head .src {
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10.5px;
+  background: #f0f2f7;
+  color: #8a90a0;
+}
+
+.cite-head .src.vector {
+  background: #eaf6ee;
+  color: #3f9c5c;
+}
+
+.cite-head .src.bm25-vector {
+  background: #f0ecfd;
+  color: #7156d6;
 }
 
 .cite-head .score {
@@ -390,6 +503,42 @@ const send = async () => {
   -webkit-line-clamp: 3;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+.session-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-top: 1px solid #eef1f6;
+  background: #fafbfd;
+  font-size: 11px;
+  color: #a8aebc;
+}
+
+.session-bar .cid {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #8a90a0;
+}
+
+.new-session {
+  margin-left: auto;
+  border: 1px solid #dfe4ee;
+  background: #fff;
+  border-radius: 7px;
+  padding: 3px 10px;
+  font-size: 11px;
+  color: #5a6072;
+  cursor: pointer;
+}
+
+.new-session:hover {
+  border-color: #4f7cf7;
+  color: #4f7cf7;
 }
 
 .composer {

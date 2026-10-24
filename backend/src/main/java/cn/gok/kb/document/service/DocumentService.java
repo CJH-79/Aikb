@@ -10,7 +10,8 @@ import cn.gok.kb.document.entity.KbDocument;
 import cn.gok.kb.document.mapper.KbDocumentMapper;
 import cn.gok.kb.parser.ParsedPage;
 import cn.gok.kb.parser.ParserFactory;
-import cn.gok.kb.search.Bm25Index;
+import cn.gok.kb.embedding.EmbeddingService;
+import cn.gok.kb.search.SearchIndexManager;
 import cn.gok.kb.split.TextSplitter;
 import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
@@ -49,7 +50,8 @@ public class DocumentService {
     private final KbChunkMapper chunkMapper;
     private final ParserFactory parserFactory;
     private final TextSplitter splitter;
-    private final Bm25Index index;
+    private final SearchIndexManager indexManager;
+    private final EmbeddingService embeddingService;
     private final KbProperties props;
 
     /**
@@ -120,7 +122,12 @@ public class DocumentService {
             // 5. 索引重建必须等事务提交后再做：
             //    在事务内重建会让重建耗时拉长事务持有时间，而且一旦回滚，
             //    索引里已经混进了不存在的数据。
-            rebuildAfterCommit();
+            //    向量化（调 embedding 接口）同理，一并放到提交之后：
+            //    外部网络调用绝不能进数据库事务，否则一次慢请求就把行锁拖成秒级。
+            afterCommit(() -> {
+                backfillEmbedding(docId);
+                safeRebuild();
+            });
 
             log.info("文档入库成功：{}，{} 页，{} 个切片", original, pages.size(), chunks.size());
             return toVO(doc);
@@ -159,15 +166,12 @@ public class DocumentService {
         if (doc.getStoredName() != null && !doc.getStoredName().isBlank()) {
             Path file = Paths.get(props.getUploadDir()).toAbsolutePath().normalize()
                     .resolve(doc.getStoredName());
-            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-                @Override
-                public void afterCommit() {
-                    deleteQuietly(file);
-                    index.rebuild();
-                }
+            afterCommit(() -> {
+                deleteQuietly(file);
+                safeRebuild();
             });
         } else {
-            rebuildAfterCommit();
+            afterCommit(this::safeRebuild);
         }
     }
 
@@ -176,31 +180,75 @@ public class DocumentService {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("docCount", docMapper.selectCount(null));
         map.put("chunkCount", chunkMapper.selectCount(null));
-        map.put("indexSize", index.size());
+        map.put("indexSize", indexManager.size());
         map.put("chunkSize", props.getChunk().getSize());
         map.put("chunkOverlap", props.getChunk().getOverlap());
+        map.put("vectorEnabled", embeddingService.isEnabled());
+        map.put("embeddingMissing", chunkMapper.countMissingEmbedding());
         return map;
     }
 
     /**
-     * 索引重建注册到事务提交之后，避免读到未提交数据；重建失败只记日志，不影响已入库的数据。
+     * 给刚入库的切片补向量。
+     *
+     * <p>放在事务提交后执行的原因：embedding 是一次 HTTP 调用，
+     * 本地模型要几百毫秒，云端接口遇到大文档更慢。放进事务里
+     * 会让 undo log 和行锁一直挂着，并发上传直接互相阻塞。
+     *
+     * <p>失败不影响正确性：切片以 embedding = NULL 落库，
+     * 检索时只走 BM25 那一路，功能仍然可用，只是少了一路召回。
      */
-    private void rebuildAfterCommit() {
+    private void backfillEmbedding(Long docId) {
+        if (!embeddingService.isEnabled()) {
+            return;
+        }
+        long start = System.currentTimeMillis();
+        List<KbChunk> chunks = chunkMapper.selectList(
+                Wrappers.<KbChunk>lambdaQuery().eq(KbChunk::getDocId, docId));
+        if (chunks.isEmpty()) {
+            return;
+        }
+        try {
+            List<float[]> vectors = embeddingService.embedAll(
+                    chunks.stream().map(KbChunk::getContent).toList());
+            if (vectors.size() != chunks.size()) {
+                log.warn("向量数量与切片数量不一致（{} vs {}），跳过补齐", vectors.size(), chunks.size());
+                return;
+            }
+            String tag = embeddingService.modelTag();
+            for (int i = 0; i < chunks.size(); i++) {
+                KbChunk patch = new KbChunk();
+                patch.setId(chunks.get(i).getId());
+                patch.setEmbedding(EmbeddingService.toJson(vectors.get(i)));
+                patch.setEmbedModel(tag);
+                chunkMapper.updateById(patch);
+            }
+            log.info("切片向量化完成：docId={}，{} 条，耗时 {} ms",
+                    docId, chunks.size(), System.currentTimeMillis() - start);
+        } catch (Exception e) {
+            log.warn("切片向量化失败，该文档将只参与 BM25 检索：{}", e.getMessage());
+        }
+    }
+
+    /**
+     * 把动作注册到事务提交之后执行；没有事务上下文时直接执行。
+     */
+    private void afterCommit(Runnable action) {
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
             TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                 @Override
                 public void afterCommit() {
-                    safeRebuild();
+                    action.run();
                 }
             });
         } else {
-            safeRebuild();
+            action.run();
         }
     }
 
     private void safeRebuild() {
         try {
-            index.rebuild();
+            indexManager.rebuildAll();
         } catch (Exception e) {
             log.error("索引重建失败，检索结果可能不是最新", e);
         }

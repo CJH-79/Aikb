@@ -3,15 +3,16 @@ package cn.gok.kb.search;
 import cn.gok.kb.chunk.mapper.KbChunkMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.context.event.ApplicationReadyEvent;
-import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 内存版 BM25 索引。
@@ -41,20 +42,7 @@ public class Bm25Index {
     private volatile IndexData data = IndexData.empty();
 
     /**
-     * 服务启动后预热索引。故意放在 ApplicationReadyEvent 且吞掉异常：
-     * 数据库还没建表时不能让整个应用起不来，前端仍可正常打开页面。
-     */
-    @EventListener(ApplicationReadyEvent.class)
-    public void warmUp() {
-        try {
-            rebuild();
-        } catch (Exception e) {
-            log.warn("索引预热失败（数据库未初始化？）：{}", e.getMessage());
-        }
-    }
-
-    /**
-     * 全量重建。文档增删后调用。
+     * 全量重建。文档增删后由 {@link SearchIndexManager} 统一调用。
      */
     public synchronized void rebuild() {
         long start = System.currentTimeMillis();
@@ -186,6 +174,29 @@ public class Bm25Index {
     /** 词出现在越少文档中，区分度越高 */
     private double idf(int df, int total) {
         return Math.log(1 + (total - df + 0.5) / (df + 0.5));
+    }
+
+    /**
+     * 按 chunkId 反查切片元信息（正文、文件名、页码），不参与打分。
+     *
+     * <p>混合检索时会用到：向量那一路单独召回的切片可能压根不在 BM25 结果里，
+     * 缺元信息就没法展示引用来源。与其再查一次库，不如从这里取——
+     * 索引里本来就存着全量切片的正文。
+     */
+    public List<ScoredChunk> findByIds(Collection<Long> chunkIds) {
+        IndexData snapshot = this.data;
+        if (chunkIds == null || chunkIds.isEmpty() || snapshot.docs.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Set<Long> want = new HashSet<>(chunkIds);
+        List<ScoredChunk> out = new ArrayList<>(want.size());
+        for (ChunkDoc doc : snapshot.docs) {
+            if (want.contains(doc.chunkId)) {
+                out.add(new ScoredChunk(doc.chunkId, doc.docId, doc.fileName, doc.fileType,
+                        doc.pageNo, doc.seqNo, doc.content, 0, 0));
+            }
+        }
+        return out;
     }
 
     public int size() {

@@ -28,12 +28,14 @@ CREATE TABLE kb_document
 
 CREATE TABLE kb_chunk
 (
-    id         BIGINT  NOT NULL AUTO_INCREMENT COMMENT '主键',
-    doc_id     BIGINT  NOT NULL COMMENT '所属文档',
-    page_no    INT     NOT NULL DEFAULT 1 COMMENT '起始页码，用于引用溯源',
-    seq_no     INT     NOT NULL DEFAULT 0 COMMENT '文档内顺序号',
-    content    TEXT    NOT NULL COMMENT '切片正文',
-    char_count INT     NOT NULL DEFAULT 0 COMMENT '字符数',
+    id         BIGINT   NOT NULL AUTO_INCREMENT COMMENT '主键',
+    doc_id     BIGINT   NOT NULL COMMENT '所属文档',
+    page_no    INT      NOT NULL DEFAULT 1 COMMENT '起始页码，用于引用溯源',
+    seq_no     INT      NOT NULL DEFAULT 0 COMMENT '文档内顺序号',
+    content    TEXT     NOT NULL COMMENT '切片正文',
+    char_count INT      NOT NULL DEFAULT 0 COMMENT '字符数',
+    embedding  MEDIUMTEXT NULL COMMENT '向量检索用的 embedding，JSON 数组；为 NULL 表示该切片只参与 BM25',
+    embed_model VARCHAR(64) NULL COMMENT '产出该向量的模型标识，换模型后可据此识别需要重算',
     PRIMARY KEY (id),
     KEY idx_doc_id (doc_id),
     KEY idx_doc_seq (doc_id, seq_no)
