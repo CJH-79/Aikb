@@ -1,0 +1,50 @@
+server:
+  port: 8081
+  address: 0.0.0.0
+
+spring:
+  application:
+    name: kb-assistant
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/kb_assistant?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&useSSL=false
+    username: ${KB_DB_USER:root}
+    password: ${KB_DB_PASSWORD:123456}
+  servlet:
+    multipart:
+      max-file-size: 30MB
+      max-request-size: 30MB
+  # 走 OpenAI 兼容协议，base-url 换成 DeepSeek / 通义 / 本地 Ollama 都能直接用
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY:sk-not-configured}
+      base-url: ${OPENAI_BASE_URL:https://api.openai.com}
+      chat:
+        options:
+          model: ${OPENAI_MODEL:gpt-4o-mini}
+          temperature: 0.2
+
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    db-config:
+      id-type: auto
+
+kb:
+  chunk:
+    size: 400
+    overlap: 60
+  search:
+    top-k: 5
+    # 归一化后的相关度下限，命中低于该值视为「查不到」，避免硬凑答案
+    min-score: 0.15
+  upload-dir: ./data/uploads
+  ai:
+    # 没有 API Key 时保持 false：检索功能照常可用，只是不生成答案
+    enabled: ${KB_AI_ENABLED:false}
+    max-context-chunks: 5
+
+logging:
+  level:
+    cn.gok.kb: info

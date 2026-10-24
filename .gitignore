@@ -1,0 +1,31 @@
+# 构建产物
+backend/target/
+frontend/dist/
+frontend/node_modules/
+
+# 上传的文件
+backend/data/
+data/
+
+# 日志
+*.log
+logs/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.ipr
+*.iws
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 环境变量（真实 Key 不要提交）
+.env
+.env.local
+
+# 本地配置覆盖
+application-local.yml
+application-local.yaml
